@@ -22,7 +22,7 @@ st.set_page_config(page_title="ECU Smart Dashboard", page_icon="🚗", layout="w
 # ══════════════════════════════════════════════════════════════════
 # SESSION STATE INIT
 # ══════════════════════════════════════════════════════════════════
-for key in ['df','analyses','col_stats','pair_stats','analyses_done','ran','uploaded_file_id']:
+for key in ['df','analyses','col_stats','pair_stats','analyses_done','ran','uploaded_file_id','cmp_df_a','cmp_df_b']:
     if key not in st.session_state:
         st.session_state[key] = None
 if 'ran' not in st.session_state:
@@ -171,7 +171,7 @@ def analyze_pair(df, col1, col2):
 
 def generate_analysis_plan(df):
     num_cols = [c for c in df.select_dtypes(include=np.number).columns
-               if c not in ['Time_Elapsed'] and not c.startswith('IS_')
+               if c not in ['Time_Elapsed','Time'] and not c.startswith('IS_')
                and c != 'Anomaly' and df[c].std() > 0]
     if not num_cols: return [], {}, {}
 
@@ -1529,7 +1529,7 @@ def build_pdf(df, analyses_done, vehicle_name):
         pdf.set_x(30)
         pdf.cell(0, 7, f"Session duration: {dur:.0f} s  ({dur/60:.1f} min)  |  {len(df):,} readings", ln=True)
     num_cols_cover = [c for c in df.select_dtypes(include=np.number).columns
-                      if c not in ['Time_Elapsed','Anomaly','RUL','NOx','CO2','Fuel_Efficiency','MAF_safe']
+                      if c not in ['Time_Elapsed','Time','Anomaly','RUL','NOx','CO2','Fuel_Efficiency','MAF_safe']
                       and not c.startswith('IS_')]
     pdf.set_x(30)
     pdf.cell(0, 7, f"Sensors: {', '.join(num_cols_cover)}", ln=True)
@@ -1589,148 +1589,435 @@ def build_pdf(df, analyses_done, vehicle_name):
     return tmp.name
 
 # ══════════════════════════════════════════════════════════════════
+# SAMPLE / DEMO DATA GENERATOR
+# ══════════════════════════════════════════════════════════════════
+def generate_sample_data(seed=42, n=300, profile='mixed'):
+    """Generate a realistic synthetic ECU log for demo purposes.
+    profile: 'mixed', 'highway', 'city', 'aggressive' — shifts the
+    underlying driving pattern so two demo sessions can be compared.
+    """
+    rng = np.random.RandomState(seed)
+    t = np.arange(n)
+
+    if profile == 'highway':
+        speed_base, speed_noise = 80, 8
+        rpm_base, rpm_noise     = 2200, 150
+        maf_base                = 12
+    elif profile == 'city':
+        speed_base, speed_noise = 30, 12
+        rpm_base, rpm_noise     = 1500, 400
+        maf_base                = 7
+    elif profile == 'aggressive':
+        speed_base, speed_noise = 60, 25
+        rpm_base, rpm_noise     = 3200, 900
+        maf_base                = 18
+    else:  # mixed
+        speed_base, speed_noise = 45, 18
+        rpm_base, rpm_noise     = 1800, 500
+        maf_base                = 9
+
+    # Smooth random-walk-ish signals so they look like a real drive
+    speed = np.clip(speed_base + np.cumsum(rng.normal(0, speed_noise*0.15, n)), 0, 180)
+    speed = np.clip(speed + rng.normal(0, 2, n), 0, 180)
+
+    rpm = np.clip(rpm_base + speed*15 + rng.normal(0, rpm_noise*0.5, n), 600, 6500)
+
+    maf = np.clip(maf_base * (rpm/2000) + rng.normal(0, 1.2, n), 0.5, 60)
+
+    intake_temp  = np.clip(28 + np.cumsum(rng.normal(0, 0.05, n)) + rng.normal(0,0.5,n), 15, 60)
+    coolant_temp = np.clip(60 + np.cumsum(rng.normal(0.05, 0.1, n)), 20, 105)
+    coolant_temp = np.minimum(coolant_temp, 92 + rng.normal(0,1,n))
+
+    throttle    = np.clip((speed/180*100) + rng.normal(0,5,n), 0, 100)
+    engine_load = np.clip(throttle*0.8 + rng.normal(0,8,n), 5, 100)
+
+    stft = np.clip(rng.normal(0, 3, n), -25, 25)
+    ltft = np.clip(rng.normal(1, 2, n) + np.sin(t/40)*2, -25, 25)
+
+    battery = np.clip(13.8 + rng.normal(0, 0.15, n), 11, 15)
+
+    df_raw = pd.DataFrame({
+        'Time':            t.astype(float),
+        'RPM':             rpm,
+        'Speed':           speed,
+        'MAF':             maf,
+        'Intake_Temp':     intake_temp,
+        'Coolant_Temp':    coolant_temp,
+        'Throttle':        throttle,
+        'Engine_Load':     engine_load,
+        'STFT':            stft,
+        'LTFT':            ltft,
+        'Battery_Voltage': battery,
+    })
+    return df_raw
+
+
+
+# ══════════════════════════════════════════════════════════════════
 # MAIN APP
 # ══════════════════════════════════════════════════════════════════
 st.title("🚗 ECU Smart Analysis Dashboard")
 st.caption("Upload any ECU CSV — statistical brain generates custom analysis automatically")
 
-uploaded = st.file_uploader("📂 Upload your ECU CSV file", type=['csv','txt'])
+tab1, tab2 = st.tabs(["📁 Single Session Analysis", "🔁 Multi-Session Comparison"])
 
-if uploaded:
-    # ── Detect new file by name+size and reset all state ──────────
-    file_id = f"{uploaded.name}_{uploaded.size}"
-    if st.session_state.uploaded_file_id != file_id:
+# ════════════════════════════════════════════════════════════════
+# TAB 1 — SINGLE SESSION ANALYSIS
+# ════════════════════════════════════════════════════════════════
+with tab1:
+    col_u, col_s = st.columns([3, 1])
+    with col_u:
+        uploaded = st.file_uploader("📂 Upload your ECU CSV file", type=['csv','txt'], key="single_upload")
+    with col_s:
+        st.write("")  # spacing
+        st.write("")
+        use_sample = st.button("🧪 Try with Sample Data", key="sample_btn", use_container_width=True)
+
+    if use_sample:
         for key in ['df','analyses','col_stats','pair_stats','selected']:
             st.session_state[key] = None
         st.session_state.ran               = False
-        st.session_state.uploaded_file_id  = file_id
-
-    if st.session_state.df is None:
-        with st.spinner("Reading and standardizing file..."):
-            raw_df, fmt = parse_file(uploaded)
-            df          = standardize(raw_df.copy())
+        st.session_state.uploaded_file_id  = 'SAMPLE_DATA'
+        raw_df = generate_sample_data(seed=42, n=300, profile='mixed')
+        df     = standardize(raw_df.copy())
         st.session_state.df  = df
-        st.session_state.fmt = fmt
-    else:
+        st.session_state.fmt = 'Sample Demo Data'
+
+    elif uploaded:
+        # ── Detect new file by name+size and reset all state ──────────
+        file_id = f"{uploaded.name}_{uploaded.size}"
+        if st.session_state.uploaded_file_id != file_id:
+            for key in ['df','analyses','col_stats','pair_stats','selected']:
+                st.session_state[key] = None
+            st.session_state.ran               = False
+            st.session_state.uploaded_file_id  = file_id
+
+        if st.session_state.df is None:
+            with st.spinner("Reading and standardizing file..."):
+                raw_df, fmt = parse_file(uploaded)
+                df          = standardize(raw_df.copy())
+            st.session_state.df  = df
+            st.session_state.fmt = fmt
+
+    if st.session_state.df is not None:
         df  = st.session_state.df
         fmt = st.session_state.get('fmt','CSV')
 
-    st.success(f"✅ **{fmt}** — {len(df):,} rows, {len(df.columns)} columns")
+        if fmt == 'Sample Demo Data':
+            st.info("ℹ️ You're viewing **synthetic sample data** generated for demo purposes — "
+                    "upload your own ECU CSV above for real analysis.")
 
-    st.subheader("📄 Full Data Preview")
-    st.dataframe(df, use_container_width=True, height=300)
+        st.success(f"✅ **{fmt}** — {len(df):,} rows, {len(df.columns)} columns")
 
-    st.subheader("📊 Data Overview")
-    num_cols = [c for c in df.select_dtypes(include=np.number).columns
-               if c not in ['Time_Elapsed'] and not c.startswith('IS_')]
-    overview = pd.DataFrame({
-        'Sensor':  num_cols,
-        'Min':     [round(df[c].min(),2) for c in num_cols],
-        'Max':     [round(df[c].max(),2) for c in num_cols],
-        'Average': [round(df[c].mean(),2) for c in num_cols],
-        'Std Dev': [round(df[c].std(),2) for c in num_cols],
-        'Missing': [int(df[c].isnull().sum()) for c in num_cols],
-    })
-    st.dataframe(overview, use_container_width=True)
+        st.subheader("📄 Full Data Preview")
+        st.dataframe(df, use_container_width=True, height=300)
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("Total Rows",     f"{len(df):,}")
-    c2.metric("Total Columns",  f"{len(df.columns)}")
-    c3.metric("Sensor Columns", f"{len(num_cols)}")
-    c4.metric("Duration",       f"{df['Time_Elapsed'].max():.0f}s" if 'Time_Elapsed' in df.columns else "N/A")
+        st.subheader("📊 Data Overview")
+        num_cols = [c for c in df.select_dtypes(include=np.number).columns
+                   if c not in ['Time_Elapsed','Time'] and not c.startswith('IS_')]
+        overview = pd.DataFrame({
+            'Sensor':  num_cols,
+            'Min':     [round(df[c].min(),2) for c in num_cols],
+            'Max':     [round(df[c].max(),2) for c in num_cols],
+            'Average': [round(df[c].mean(),2) for c in num_cols],
+            'Std Dev': [round(df[c].std(),2) for c in num_cols],
+            'Missing': [int(df[c].isnull().sum()) for c in num_cols],
+        })
+        st.dataframe(overview, use_container_width=True)
 
-    vehicle_name = st.text_input("🚗 Vehicle Name (optional)", placeholder="e.g. Honda City 2019")
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Total Rows",     f"{len(df):,}")
+        c2.metric("Total Columns",  f"{len(df.columns)}")
+        c3.metric("Sensor Columns", f"{len(num_cols)}")
+        c4.metric("Duration",       f"{df['Time_Elapsed'].max():.0f}s" if 'Time_Elapsed' in df.columns else "N/A")
 
-    st.divider()
-
-    if st.button("🧠 Analyse My Data", type="primary"):
-        with st.spinner("🔍 Running statistical analysis..."):
-            analyses, col_stats, pair_stats = generate_analysis_plan(df)
-        st.session_state.analyses   = analyses
-        st.session_state.col_stats  = col_stats
-        st.session_state.pair_stats = pair_stats
-        st.session_state.ran        = False
-
-    if st.session_state.analyses:
-        analyses   = st.session_state.analyses
-        col_stats  = st.session_state.col_stats
-        pair_stats = st.session_state.pair_stats
-
-        st.success(f"✅ Brain found **{len(analyses)} analyses** for your data!")
-
-        strong = sorted(pair_stats.items(), key=lambda x: abs(x[1]['pearson_r']), reverse=True)[:6]
-        if strong:
-            with st.expander("🔗 Strongest Sensor Relationships Found", expanded=False):
-                rel_data = pd.DataFrame([{
-                    'Sensor 1':    p[0][0],
-                    'Sensor 2':    p[0][1],
-                    'Correlation': f"{p[1]['pearson_r']:.3f}",
-                    'Strength':    'Strong' if abs(p[1]['pearson_r'])>0.6 else 'Moderate',
-                    'Direction':   p[1]['direction'].capitalize(),
-                    'Nonlinear':   '✅' if p[1]['is_nonlinear'] else '❌',
-                } for p in strong])
-                st.dataframe(rel_data, use_container_width=True)
-
-        st.subheader("✅ Select Analyses to Run")
-        selected = []
-        cols_ui  = st.columns(2)
-        for i, a in enumerate(analyses):
-            with cols_ui[i%2]:
-                if st.checkbox(
-                    f"{a['title']}  \n*Accuracy: {a['accuracy']} | Score: {a['score']:.0f}/100*",
-                    value=True, key=f"sel_{a['id']}"):
-                    selected.append(a)
-
-        if st.button("▶️ Run Selected Analyses", type="primary"):
-            st.session_state.selected      = selected
-            st.session_state.ran           = True
-            st.session_state.vehicle_name  = vehicle_name
-
-    if st.session_state.ran and st.session_state.get('selected'):
-        selected     = st.session_state.selected
-        vehicle_name = st.session_state.get('vehicle_name','')
-        df           = st.session_state.df
-        analyses_done= []
+        vehicle_name = st.text_input("🚗 Vehicle Name (optional)", placeholder="e.g. Honda City 2019", key="vname_single")
 
         st.divider()
-        st.subheader("📊 Analysis Results")
 
-        for a in selected:
-            st.subheader(a['title'])
-            with st.expander("ℹ️ What is this and why is it useful?", expanded=False):
-                st.markdown(f"**📌 What it does:** {a['description']}")
-                st.markdown(f"**💡 Why useful:** {a['why_useful']}")
-                st.markdown(f"**🔎 What brain found:** {a['what_found']}")
-                st.markdown(f"**📊 Accuracy:** {a['accuracy']}  |  **Score:** {a['score']:.0f}/100")
-                st.markdown(f"**🔧 Columns:** {', '.join(a['cols'])}")
+        if st.button("🧠 Analyse My Data", type="primary", key="analyse_single"):
+            with st.spinner("🔍 Running statistical analysis..."):
+                analyses, col_stats, pair_stats = generate_analysis_plan(df)
+            st.session_state.analyses   = analyses
+            st.session_state.col_stats  = col_stats
+            st.session_state.pair_stats = pair_stats
+            st.session_state.ran        = False
 
-            result = execute(df, a)
-            if result:
-                analyses_done.append(a)
+        if st.session_state.analyses:
+            analyses   = st.session_state.analyses
+            col_stats  = st.session_state.col_stats
+            pair_stats = st.session_state.pair_stats
+
+            st.success(f"✅ Brain found **{len(analyses)} analyses** for your data!")
+
+            strong = sorted(pair_stats.items(), key=lambda x: abs(x[1]['pearson_r']), reverse=True)[:6]
+            if strong:
+                with st.expander("🔗 Strongest Sensor Relationships Found", expanded=False):
+                    rel_data = pd.DataFrame([{
+                        'Sensor 1':    p[0][0],
+                        'Sensor 2':    p[0][1],
+                        'Correlation': f"{p[1]['pearson_r']:.3f}",
+                        'Strength':    'Strong' if abs(p[1]['pearson_r'])>0.6 else 'Moderate',
+                        'Direction':   p[1]['direction'].capitalize(),
+                        'Nonlinear':   '✅' if p[1]['is_nonlinear'] else '❌',
+                    } for p in strong])
+                    st.dataframe(rel_data, use_container_width=True)
+
+            st.subheader("✅ Select Analyses to Run")
+            selected = []
+            cols_ui  = st.columns(2)
+            for i, a in enumerate(analyses):
+                with cols_ui[i%2]:
+                    if st.checkbox(
+                        f"{a['title']}  \n*Accuracy: {a['accuracy']} | Score: {a['score']:.0f}/100*",
+                        value=True, key=f"sel_{a['id']}"):
+                        selected.append(a)
+
+            if st.button("▶️ Run Selected Analyses", type="primary", key="run_single"):
+                st.session_state.selected      = selected
+                st.session_state.ran           = True
+                st.session_state.vehicle_name  = vehicle_name
+
+        if st.session_state.ran and st.session_state.get('selected'):
+            selected     = st.session_state.selected
+            vehicle_name = st.session_state.get('vehicle_name','')
+            df           = st.session_state.df
+            analyses_done= []
+
+            st.divider()
+            st.subheader("📊 Analysis Results")
+
+            for a in selected:
+                st.subheader(a['title'])
+                with st.expander("ℹ️ What is this and why is it useful?", expanded=False):
+                    st.markdown(f"**📌 What it does:** {a['description']}")
+                    st.markdown(f"**💡 Why useful:** {a['why_useful']}")
+                    st.markdown(f"**🔎 What brain found:** {a['what_found']}")
+                    st.markdown(f"**📊 Accuracy:** {a['accuracy']}  |  **Score:** {a['score']:.0f}/100")
+                    st.markdown(f"**🔧 Columns:** {', '.join(a['cols'])}")
+
+                result = execute(df, a)
+                if result:
+                    analyses_done.append(a)
+                st.divider()
+
+            st.subheader("📥 Download Reports")
+            c1, c2 = st.columns(2)
+
+            with c1:
+                csv = df.to_csv(index=False).encode('utf-8')
+                st.download_button("📊 Download Cleaned CSV", csv,
+                                  file_name="cleaned_ecu.csv", mime="text/csv", key="csv_dl_single")
+
+            with c2:
+                if analyses_done:
+                    with st.spinner("Building PDF report..."):
+                        pdf_path = build_pdf(df, analyses_done, vehicle_name)
+                    with open(pdf_path,'rb') as f:
+                        pdf_bytes = f.read()
+                    os.unlink(pdf_path)
+                    st.download_button(
+                        "📄 Download PDF Report",
+                        data=pdf_bytes,
+                        file_name=f"ecu_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                        mime="application/pdf",
+                        key="pdf_download_single"
+                    )
+                    st.success("✅ PDF ready — click above to download!")
+                else:
+                    st.info("No completed analyses to include in PDF yet.")
+    else:
+        st.info("👆 Upload an ECU CSV file, or click **Try with Sample Data** to explore the dashboard.")
+
+
+# ════════════════════════════════════════════════════════════════
+# TAB 2 — MULTI-SESSION COMPARISON
+# ════════════════════════════════════════════════════════════════
+with tab2:
+    st.markdown(
+        "Compare two drive sessions side by side — e.g. **before vs after** a tune, "
+        "a service, or simply two different drives."
+    )
+
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.markdown("### Session A")
+        upA = st.file_uploader("Upload CSV for Session A", type=['csv','txt'], key="cmp_upload_a")
+        sampleA = st.button("🧪 Use sample data (Session A)", key="cmp_sample_a", use_container_width=True)
+        nameA = st.text_input("Label for Session A", value="Session A", key="cmp_name_a")
+
+    with colB:
+        st.markdown("### Session B")
+        upB = st.file_uploader("Upload CSV for Session B", type=['csv','txt'], key="cmp_upload_b")
+        sampleB = st.button("🧪 Use sample data (Session B)", key="cmp_sample_b", use_container_width=True)
+        nameB = st.text_input("Label for Session B", value="Session B", key="cmp_name_b")
+
+    # Resolve dataframes for A and B
+    df_a = None
+    df_b = None
+
+    if sampleA:
+        st.session_state.cmp_df_a = standardize(generate_sample_data(seed=42, n=300, profile='city').copy())
+    elif upA is not None:
+        raw_a, _ = parse_file(upA)
+        st.session_state.cmp_df_a = standardize(raw_a.copy())
+
+    if sampleB:
+        st.session_state.cmp_df_b = standardize(generate_sample_data(seed=99, n=300, profile='highway').copy())
+    elif upB is not None:
+        raw_b, _ = parse_file(upB)
+        st.session_state.cmp_df_b = standardize(raw_b.copy())
+
+    df_a = st.session_state.get('cmp_df_a')
+    df_b = st.session_state.get('cmp_df_b')
+
+    if df_a is None or df_b is None:
+        st.info("👆 Provide data for both Session A and Session B (upload files or use sample data) to compare.")
+    else:
+        st.divider()
+        st.subheader("📊 Comparison Overview")
+
+        # Common numeric sensors present in both sessions
+        num_a = set(c for c in df_a.select_dtypes(include=np.number).columns
+                     if c not in ['Time_Elapsed','Time'] and not c.startswith('IS_'))
+        num_b = set(c for c in df_b.select_dtypes(include=np.number).columns
+                     if c not in ['Time_Elapsed','Time'] and not c.startswith('IS_'))
+        common = sorted(num_a & num_b)
+
+        if not common:
+            st.warning("⚠️ No common sensors found between the two sessions — cannot compare directly.")
+        else:
+            # ── Summary metric comparison table ────────────────────
+            comp_rows = []
+            for c in common:
+                comp_rows.append({
+                    'Sensor':            c,
+                    f'{nameA} Avg':      round(df_a[c].mean(), 2),
+                    f'{nameB} Avg':      round(df_b[c].mean(), 2),
+                    'Difference':        round(df_b[c].mean() - df_a[c].mean(), 2),
+                    f'{nameA} Max':      round(df_a[c].max(), 2),
+                    f'{nameB} Max':      round(df_b[c].max(), 2),
+                })
+            comp_df = pd.DataFrame(comp_rows)
+            st.dataframe(comp_df, use_container_width=True)
+
+            # ── Session length comparison ──────────────────────────
+            c1, c2, c3 = st.columns(3)
+            dur_a = df_a['Time_Elapsed'].max() if 'Time_Elapsed' in df_a.columns else len(df_a)
+            dur_b = df_b['Time_Elapsed'].max() if 'Time_Elapsed' in df_b.columns else len(df_b)
+            c1.metric(f"{nameA} duration", f"{dur_a:.0f}s")
+            c2.metric(f"{nameB} duration", f"{dur_b:.0f}s")
+            c3.metric("Common sensors", str(len(common)))
+
             st.divider()
 
-        st.subheader("📥 Download Reports")
-        c1, c2 = st.columns(2)
+            # ── Overlaid time series for each common sensor ───────
+            st.subheader("📈 Sensor Comparison Over Time")
+            pick_cols = st.multiselect(
+                "Choose sensors to compare",
+                options=common,
+                default=common[:min(3, len(common))]
+            )
+            for c in pick_cols:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=df_a['Time_Elapsed'], y=df_a[c], name=nameA,
+                    line=dict(color='steelblue')))
+                fig.add_trace(go.Scatter(
+                    x=df_b['Time_Elapsed'], y=df_b[c], name=nameB,
+                    line=dict(color='tomato')))
+                fig.update_layout(title=f'{c}: {nameA} vs {nameB}',
+                                  xaxis_title='Time Elapsed (s)', yaxis_title=c)
+                st.plotly_chart(fig, use_container_width=True)
 
-        with c1:
-            csv = df.to_csv(index=False).encode('utf-8')
-            st.download_button("📊 Download Cleaned CSV", csv,
-                              file_name="cleaned_ecu.csv", mime="text/csv")
+            st.divider()
 
-        with c2:
-            if analyses_done:
-                with st.spinner("Building PDF report..."):
-                    pdf_path = build_pdf(df, analyses_done, vehicle_name)
-                with open(pdf_path,'rb') as f:
-                    pdf_bytes = f.read()
-                os.unlink(pdf_path)
-                st.download_button(
-                    "📄 Download PDF Report",
-                    data=pdf_bytes,
-                    file_name=f"ecu_report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                    mime="application/pdf",
-                    key="pdf_download"
-                )
-                st.success("✅ PDF ready — click above to download!")
-            else:
-                st.info("No completed analyses to include in PDF yet.")
+            # ── Driver score comparison (if RPM present in both) ───
+            if 'RPM' in common:
+                st.subheader("🏎️ Driver Behaviour Comparison")
+
+                def _driver_score(d):
+                    rpm_std      = float(d['RPM'].std())
+                    over_rev_pct = (d['RPM']>4000).mean()*100
+                    if 'Speed' in d.columns:
+                        idle_pct = ((d['RPM']<800) & (d['Speed']<2)).mean()*100
+                    else:
+                        idle_pct = (d['RPM']<800).mean()*100
+                    speed_std = d['Speed'].std() if 'Speed' in d.columns else 0
+                    scores = {
+                        'Smoothness':      max(0,100-rpm_std/50),
+                        'Rev Control':     max(0,100-over_rev_pct*2),
+                        'Idle Efficiency': max(0,100-idle_pct),
+                        'Speed Stability': max(0,100-speed_std*2),
+                    }
+                    overall = sum(list(scores.values())[i]*[0.3,0.3,0.2,0.2][i] for i in range(4))
+                    scores['Overall'] = overall
+                    return scores
+
+                scores_a = _driver_score(df_a)
+                scores_b = _driver_score(df_b)
+
+                score_comp = pd.DataFrame({
+                    'Metric': list(scores_a.keys()),
+                    nameA:    [round(v,1) for v in scores_a.values()],
+                    nameB:    [round(v,1) for v in scores_b.values()],
+                })
+                st.dataframe(score_comp, use_container_width=True)
+
+                fig = go.Figure()
+                categories = list(scores_a.keys())[:-1]  # exclude Overall for radar
+                fig.add_trace(go.Scatterpolar(
+                    r=[scores_a[k] for k in categories] + [scores_a[categories[0]]],
+                    theta=categories + [categories[0]],
+                    fill='toself', name=nameA, line_color='steelblue'))
+                fig.add_trace(go.Scatterpolar(
+                    r=[scores_b[k] for k in categories] + [scores_b[categories[0]]],
+                    theta=categories + [categories[0]],
+                    fill='toself', name=nameB, line_color='tomato'))
+                fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,100])),
+                                  title='Driving Behaviour Radar Comparison')
+                st.plotly_chart(fig, use_container_width=True)
+
+                if scores_a['Overall'] > scores_b['Overall']:
+                    st.success(f"✅ **{nameA}** had a smoother / more economical driving profile "
+                               f"({scores_a['Overall']:.1f} vs {scores_b['Overall']:.1f}).")
+                elif scores_b['Overall'] > scores_a['Overall']:
+                    st.success(f"✅ **{nameB}** had a smoother / more economical driving profile "
+                               f"({scores_b['Overall']:.1f} vs {scores_a['Overall']:.1f}).")
+                else:
+                    st.info("Both sessions scored equally on driving behaviour.")
+
+            # ── Fuel efficiency comparison (if MAF + Speed present) ─
+            if 'MAF' in common and 'Speed' in common:
+                st.divider()
+                st.subheader("⛽ Fuel Efficiency Comparison")
+
+                AFR, DENSITY = 14.7, 0.745
+                def _fe(d):
+                    maf   = d['MAF'].replace(0, np.nan)
+                    speed = d['Speed'].replace(0, np.nan)
+                    fuel_L_per_h = (maf / (AFR * DENSITY)) * 3.6
+                    fe = (speed / fuel_L_per_h).replace([np.inf,-np.inf], np.nan).clip(0,40)
+                    return fe.dropna()
+
+                fe_a, fe_b = _fe(df_a), _fe(df_b)
+                c1, c2 = st.columns(2)
+                if len(fe_a) >= 5:
+                    c1.metric(f"{nameA} avg efficiency", f"{fe_a.mean():.1f} km/l")
+                else:
+                    c1.metric(f"{nameA} avg efficiency", "N/A (mostly stationary)")
+                if len(fe_b) >= 5:
+                    c2.metric(f"{nameB} avg efficiency", f"{fe_b.mean():.1f} km/l")
+                else:
+                    c2.metric(f"{nameB} avg efficiency", "N/A (mostly stationary)")
+
+                if len(fe_a) >= 5 and len(fe_b) >= 5:
+                    if fe_a.mean() > fe_b.mean():
+                        st.success(f"✅ **{nameA}** was more fuel-efficient "
+                                   f"({fe_a.mean():.1f} vs {fe_b.mean():.1f} km/l).")
+                    elif fe_b.mean() > fe_a.mean():
+                        st.success(f"✅ **{nameB}** was more fuel-efficient "
+                                   f"({fe_b.mean():.1f} vs {fe_a.mean():.1f} km/l).")
+                    else:
+                        st.info("Both sessions had similar fuel efficiency.")
