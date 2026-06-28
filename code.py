@@ -269,7 +269,7 @@ def generate_analysis_plan(df):
             'what_found':'Formula: km/l = (14.7 x 6.17 x 4546 x Speed) / (3600 x MAF)'})
         analyses.append({'id':'co2_emissions','title':'🌿 CO2 Emissions Estimation','type':'co2','cols':['MAF','Speed'],'score':91,'accuracy':'85%',
             'description':'Estimates CO2 in g/km from MAF and Speed.',
-            'why_useful':'CO2 is direct measure of fuel burn. <120 g/km eco, 120-180 moderate, >180 high.',
+            'why_useful':'CO2 output is directly proportional to fuel burned. This analysis is consistent with the fuel efficiency result — if fuel economy is good, CO2 will be low, and vice versa.',
             'what_found':'Will calculate CO2 g/km for every reading.'})
 
     fuel_trim_cols = [c for c in ['STFT','LTFT'] if c in num_cols]
@@ -330,9 +330,56 @@ def execute(df, analysis):
                     st.plotly_chart(fig, use_container_width=True)
 
         elif atype == 'heatmap':
-            fig = px.imshow(df[cols].corr(), text_auto='.2f',
-                           color_continuous_scale='RdBu_r', title='Sensor Correlation Matrix')
-            st.plotly_chart(fig, use_container_width=True)
+            corr_matrix = df[cols].corr()
+            n_sensors   = len(cols)
+            # Dynamic sizing: minimum 500px, 60px per sensor
+            chart_size  = max(500, n_sensors * 60)
+            fig = px.imshow(
+                corr_matrix,
+                text_auto='.2f',
+                color_continuous_scale='RdBu_r',
+                title='Sensor Correlation Matrix',
+                zmin=-1, zmax=1,
+                aspect='auto',
+            )
+            fig.update_layout(
+                height=chart_size,
+                width=chart_size,
+                title_font_size=16,
+                coloraxis_colorbar=dict(
+                    title='Correlation',
+                    thickness=15,
+                    len=0.8,
+                ),
+            )
+            fig.update_traces(
+                textfont=dict(size=max(8, min(14, int(200/n_sensors)))),
+            )
+            fig.update_xaxes(tickangle=-45, tickfont=dict(size=max(9, min(13, int(180/n_sensors)))))
+            fig.update_yaxes(tickfont=dict(size=max(9, min(13, int(180/n_sensors)))))
+
+            # Render in a scrollable container so small screens can still zoom
+            st.plotly_chart(fig, use_container_width=False)
+
+            # Also show a clean sortable table of strong pairs below
+            st.markdown("**Strong Correlations (|r| > 0.5)**")
+            pairs = []
+            for i, c1 in enumerate(cols):
+                for c2 in cols[i+1:]:
+                    r_val = corr_matrix.loc[c1, c2]
+                    if abs(r_val) > 0.5:
+                        pairs.append({
+                            'Sensor A': c1,
+                            'Sensor B': c2,
+                            'Correlation (r)': round(r_val, 3),
+                            'Strength': 'Strong' if abs(r_val)>0.7 else 'Moderate',
+                            'Direction': 'Positive' if r_val>0 else 'Negative',
+                        })
+            if pairs:
+                pairs_df = pd.DataFrame(pairs).sort_values('Correlation (r)', key=abs, ascending=False)
+                st.dataframe(pairs_df, use_container_width=True)
+            else:
+                st.info("No sensor pairs with correlation above 0.5 found in this dataset.")
 
         elif atype == 'trend':
             col = cols[0]
@@ -516,8 +563,8 @@ def execute(df, analysis):
                 st.plotly_chart(fig2, use_container_width=True)
 
                 if avg_fe > 12:   st.success(f"✅ Good fuel economy: {avg_fe:.1f} km/l")
-                elif avg_fe > 8:  st.warning(f"⚠️ Average fuel economy: {avg_fe:.1f} km/l")
-                else:             st.error(f"❌ Poor fuel economy: {avg_fe:.1f} km/l — check for rich mixture or aggressive driving")
+                elif avg_fe > 8:  st.warning(f"⚠️ Average fuel economy: {avg_fe:.1f} km/l — typical for city/mixed driving")
+                else:             st.error(f"❌ Below average fuel economy: {avg_fe:.1f} km/l — check driving style or engine condition")
 
         # ── CO2 ─────────────────────────────────────────────────────
         elif atype == 'co2':
@@ -545,21 +592,37 @@ def execute(df, analysis):
                 c1.metric("MAF avg (g/s)", f"{df['MAF'].mean():.2f}")
                 c2.metric("Speed avg",     f"{df['Speed'].mean():.1f} km/h")
             else:
-                avg = valid.mean()
+                avg     = valid.mean()
+                # Convert CO2 back to equivalent km/l for consistent verdicts
+                # CO2 (g/km) = 2310 / (km/l), so km/l = 2310 / CO2
+                avg_kml = CO2_PER_LITRE / avg if avg > 0 else 0
+
                 c1, c2, c3 = st.columns(3)
                 c1.metric("Avg CO2", f"{avg:.1f} g/km")
                 c2.metric("Max CO2", f"{valid.max():.1f} g/km")
                 c3.metric("Min CO2", f"{valid.min():.1f} g/km")
-                if avg < 120:   st.success(f"✅ CO2 low: {avg:.1f} g/km — eco driving")
-                elif avg < 180: st.warning(f"⚠️ CO2 moderate: {avg:.1f} g/km")
-                else:           st.error(f"❌ CO2 high: {avg:.1f} g/km — heavy fuel use")
+
+                # Verdicts derived from km/l equivalent so they always
+                # match the fuel efficiency analysis (same underlying data).
+                # 12 km/l = 192 g/km, 8 km/l = 288 g/km
+                if avg_kml > 12:
+                    st.success(f"✅ CO2: {avg:.1f} g/km — consistent with good fuel economy ({avg_kml:.1f} km/l equivalent)")
+                elif avg_kml > 8:
+                    st.warning(f"⚠️ CO2: {avg:.1f} g/km — consistent with average fuel economy ({avg_kml:.1f} km/l equivalent)")
+                else:
+                    st.error(f"❌ CO2: {avg:.1f} g/km — consistent with below average fuel economy ({avg_kml:.1f} km/l equivalent)")
 
                 plot_df = pd.DataFrame({'Time_Elapsed': df['Time_Elapsed'], 'CO2': co2}).dropna()
                 fig = px.line(plot_df, x='Time_Elapsed', y='CO2',
                              title='CO2 Emissions Over Time (g/km)',
                              color_discrete_sequence=['tomato'])
-                fig.add_hline(y=120, line_dash='dot', line_color='green',  annotation_text='Eco limit 120')
-                fig.add_hline(y=180, line_dash='dot', line_color='red',    annotation_text='High limit 180')
+                # Reference lines derived from same km/l thresholds as fuel efficiency
+                # 12 km/l -> 192 g/km (good/average boundary)
+                # 8 km/l  -> 288 g/km (average/poor boundary)
+                fig.add_hline(y=192, line_dash='dot', line_color='green',
+                              annotation_text='Good economy boundary (12 km/l)')
+                fig.add_hline(y=288, line_dash='dot', line_color='red',
+                              annotation_text='Below average boundary (8 km/l)')
                 fig.update_layout(yaxis_title='g/km', xaxis_title='Time Elapsed (s)')
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -670,7 +733,39 @@ class ECU_PDF(FPDF):
         self.cell(0, 8, f'Page {self.page_no()}  |  Generated {datetime.now().strftime("%Y-%m-%d %H:%M")}', align='C')
         self.set_text_color(*_BLACK)
 
-    # ── big section banner ────────────────────────────────────────
+    # ── start a full-page "analysis card": title banner above a
+    #    bordered content box; the box becomes the writable area
+    #    for everything that follows on this page ───────────────────
+    def start_analysis_page(self, title):
+        self.add_page()
+        # Title banner sits ABOVE the box, full width
+        self.set_fill_color(*_BLUE)
+        self.set_text_color(*_WHITE)
+        self.set_font('Arial', 'B', 13)
+        self.set_xy(8, self.get_y())
+        self.cell(194, 11, _safe(title), ln=True, fill=True, align='C')
+        self.set_text_color(*_BLACK)
+        self.ln(2)
+
+        box_top    = self.get_y()
+        box_bottom = 282  # leave room for the footer
+        self.set_draw_color(*_MGRAY)
+        self.set_line_width(0.6)
+        self.rect(8, box_top, 194, box_bottom - box_top)
+        self.set_line_width(0.2)
+
+        # Pad all subsequent content inside the box
+        self.set_left_margin(14)
+        self.set_right_margin(14)
+        self.set_x(14)
+        self.set_y(box_top + 5)
+
+    # ── reset margins (call after finishing an analysis page) ──────
+    def end_analysis_page(self):
+        self.set_left_margin(10)
+        self.set_right_margin(10)
+
+    # ── big section banner (cover/summary pages) ───────────────────
     def section(self, title):
         self.set_fill_color(*_NAVY)
         self.set_text_color(*_WHITE)
@@ -679,7 +774,7 @@ class ECU_PDF(FPDF):
         self.set_text_color(*_BLACK)
         self.ln(2)
 
-    # ── analysis title banner ─────────────────────────────────────
+    # ── analysis title banner (kept for compatibility) ─────────────
     def subsection(self, title):
         self.set_fill_color(*_BLUE)
         self.set_text_color(*_WHITE)
@@ -692,9 +787,10 @@ class ECU_PDF(FPDF):
     def insight_label(self, text):
         self.set_fill_color(*_LBLUE)
         self.set_text_color(*_NAVY)
-        self.set_font('Arial', 'BI', 9)
-        self.cell(0, 7, _safe(text), ln=True, fill=True)
+        self.set_font('Arial', 'BI', 10)
+        self.cell(0, 8, _safe(text), ln=True, fill=True)
         self.set_text_color(*_BLACK)
+        self.ln(1)
 
     # ── plain body paragraph ──────────────────────────────────────
     def body(self, text):
@@ -720,37 +816,34 @@ class ECU_PDF(FPDF):
         self.set_text_color(*_BLACK)
         self.cell(0, 7, _safe(val), ln=True)
 
-    # ── metric box row (up to 4 boxes) ───────────────────────────
+    # ── metric box row (up to 4 boxes), margin-aware ───────────────
     def metric_row(self, items):
         """items = list of (label, value) tuples, max 4."""
-        # Manual page-break check: metric_row uses raw rect()/set_xy() which
-        # does NOT trigger fpdf's automatic page break, so check ourselves.
         ROW_HEIGHT = 22
         if self.get_y() + ROW_HEIGHT > self.page_break_trigger:
             self.add_page()
 
-        n    = len(items)
-        w    = (self.w - 20) / n
-        x0   = self.get_x()
-        y0   = self.get_y()
+        n     = len(items)
+        lm    = self.l_margin
+        rm    = self.r_margin
+        avail = self.w - lm - rm
+        w     = avail / n
+        y0    = self.get_y()
         for i, (label, value) in enumerate(items):
-            x = 10 + i * w
-            # box background
+            x = lm + i * w
             self.set_fill_color(*_LGRAY)
             self.set_draw_color(*_MGRAY)
             self.rect(x, y0, w - 2, 18, 'FD')
-            # value
             self.set_font('Arial', 'B', 12)
             self.set_text_color(*_NAVY)
             self.set_xy(x, y0 + 2)
             self.cell(w - 2, 7, _safe(str(value)), align='C')
-            # label
             self.set_font('Arial', '', 8)
             self.set_text_color(80, 80, 100)
             self.set_xy(x, y0 + 10)
             self.cell(w - 2, 5, _safe(label), align='C')
         self.set_text_color(*_BLACK)
-        self.set_xy(10, y0 + ROW_HEIGHT)
+        self.set_xy(lm, y0 + ROW_HEIGHT)
 
     # ── verdict badge ─────────────────────────────────────────────
     def verdict(self, status, text):
@@ -760,23 +853,22 @@ class ECU_PDF(FPDF):
             'critical': (_RED,   _WHITE, 'CRITICAL'),
         }
         bg, fg, badge = cfg.get(status, (_BLACK, _WHITE, 'NOTE'))
-        # Badge pill
         self.set_fill_color(*bg)
         self.set_text_color(*fg)
         self.set_font('Arial', 'B', 9)
-        self.cell(22, 7, badge, fill=True, align='C')
-        # Text
+        self.cell(24, 7, badge, fill=True, align='C')
         self.set_fill_color(*_LGRAY)
         self.set_text_color(*_BLACK)
         self.set_font('Arial', '', 9)
-        remaining = self.w - self.get_x() - 10
+        remaining = self.w - self.get_x() - self.r_margin
         self.cell(remaining, 7, _safe(text), fill=True, ln=True)
         self.ln(2)
 
-    # ── thin horizontal rule ──────────────────────────────────────
+    # ── thin horizontal rule, margin-aware ──────────────────────────
     def rule(self):
+        lm, rm = self.l_margin, self.r_margin
         self.set_draw_color(*_MGRAY)
-        self.line(10, self.get_y(), 200, self.get_y())
+        self.line(lm, self.get_y(), self.w - rm, self.get_y())
         self.ln(3)
 
 
@@ -1353,41 +1445,50 @@ def _summarize_analysis(pdf, df, a):
             pdf.verdict('warn', "CO2 could not be calculated — vehicle was mostly stationary.")
         else:
             avg = valid.mean()
+            # Convert to km/l equivalent for consistent verdicts
+            avg_kml = CO2_PER_LITRE / avg if avg > 0 else 0
             pdf.metric_row([
-                ('Average CO2', f"{avg:.1f} g/km"),
-                ('Max CO2',     f"{valid.max():.1f} g/km"),
-                ('Min CO2',     f"{valid.min():.1f} g/km"),
-                ('EU Eco limit','120 g/km'),
+                ('Average CO2',     f"{avg:.1f} g/km"),
+                ('Max CO2',         f"{valid.max():.1f} g/km"),
+                ('Min CO2',         f"{valid.min():.1f} g/km"),
+                ('km/l equivalent', f"{avg_kml:.1f} km/l"),
             ])
             pdf.body(
-                f"Estimated CO2 averaged {avg:.1f} g/km. The EU eco benchmark is <120 g/km; "
-                f">180 g/km is considered high."
+                f"Estimated CO2 averaged {avg:.1f} g/km, which is equivalent to a fuel "
+                f"economy of {avg_kml:.1f} km/l. These two figures are derived from the "
+                f"same underlying calculation and their verdicts are therefore consistent "
+                f"with each other."
             )
             pdf.rule()
             pdf.insight_label('What This Means for Your Vehicle')
-            if avg < 120:
+            if avg_kml > 12:
                 pdf.body(
-                    f"CO2 at {avg:.1f} g/km is within the eco range. This vehicle is operating "
-                    f"efficiently and would likely pass modern emissions standards. "
-                    f"Maintaining good fuel economy habits will keep emissions low."
+                    f"CO2 at {avg:.1f} g/km is consistent with good fuel economy "
+                    f"({avg_kml:.1f} km/l). The engine is using fuel efficiently for "
+                    f"the distance being covered. Maintaining correct tyre pressures, "
+                    f"a clean air filter, and smooth driving habits will help sustain "
+                    f"this level."
                 )
-            elif avg < 180:
+            elif avg_kml > 8:
                 pdf.body(
-                    f"CO2 at {avg:.1f} g/km is in the moderate range. This is typical for "
-                    f"larger-engined vehicles or city driving. Smoother driving, correct "
-                    f"tyre pressures, and timely servicing can reduce this further."
+                    f"CO2 at {avg:.1f} g/km is consistent with average fuel economy "
+                    f"({avg_kml:.1f} km/l). This is typical for mixed city and "
+                    f"highway driving. Smoother acceleration, earlier gear changes, "
+                    f"and avoiding unnecessary idling can help reduce this further."
                 )
             else:
                 pdf.body(
-                    f"CO2 at {avg:.1f} g/km is high. Possible causes: engine running rich, "
-                    f"faulty injectors, worn O2 sensor, aggressive driving, or a heavy load. "
-                    f"A diagnostic check focusing on fuelling and emissions systems is advised."
+                    f"CO2 at {avg:.1f} g/km is consistent with below-average fuel "
+                    f"economy ({avg_kml:.1f} km/l). The engine is burning more fuel "
+                    f"than expected for the distance covered. Common causes include "
+                    f"aggressive driving, an engine running rich, fouled injectors, "
+                    f"or a faulty MAF or O2 sensor. A diagnostic check is advisable."
                 )
-            status = 'ok' if avg<120 else ('warn' if avg<180 else 'critical')
+            status = 'ok' if avg_kml>12 else ('warn' if avg_kml>8 else 'critical')
             pdf.verdict(status,
-                "CO2 is within eco range." if avg<120
-                else ("CO2 is moderate." if avg<180
-                else "High CO2 — fuelling system check recommended."))
+                f"CO2 consistent with good fuel economy ({avg_kml:.1f} km/l)." if avg_kml>12
+                else (f"CO2 consistent with average fuel economy ({avg_kml:.1f} km/l)." if avg_kml>8
+                else f"CO2 consistent with below-average fuel economy ({avg_kml:.1f} km/l) — investigate."))
 
     # ── FUEL TRIM ─────────────────────────────────────────────────
     elif atype == 'fuel_trim':
@@ -1497,6 +1598,9 @@ def _summarize_analysis(pdf, df, a):
 
 def build_pdf(df, analyses_done, vehicle_name):
     pdf = ECU_PDF()
+    # Bottom margin of 15mm -> page_break_trigger at 297-15 = 282,
+    # matching the analysis-card box bottom edge.
+    pdf.set_auto_page_break(auto=True, margin=15)
 
     # ── COVER PAGE ────────────────────────────────────────────────
     pdf.add_page()
@@ -1553,7 +1657,7 @@ def build_pdf(df, analyses_done, vehicle_name):
         pdf.cell(90, 6, title_clean)
         pdf.set_font('Arial', '', 9)
         pdf.set_text_color(*_BLACK)
-        pdf.cell(0, 6, _safe(f"Accuracy: {a['accuracy']}  |  Confidence: {a['score']:.0f}/100"), ln=True)
+        pdf.cell(0, 6, _safe(f"{a['accuracy']}"), ln=True)
     pdf.ln(4)
 
     # ── DRIVE SUMMARY PAGE ────────────────────────────────────────
@@ -1571,18 +1675,19 @@ def build_pdf(df, analyses_done, vehicle_name):
         except: pass
     pdf.ln(4)
 
-    # ── PER-ANALYSIS PAGES ────────────────────────────────────────
+    # ── PER-ANALYSIS PAGES (one boxed "card" per analysis) ─────────
     for a in analyses_done:
-        pdf.add_page()
-        pdf.subsection(_safe(a['title']))
-        pdf.note(f"Accuracy: {a['accuracy']}  |  Confidence: {a['score']:.0f}/100  |  {_safe(a['description'])}")
+        pdf.start_analysis_page(_safe(a['title']))
+        pdf.note(f"{a['accuracy']}  |  {_safe(a['description'])}")
         pdf.ln(1)
         try:
             _summarize_analysis(pdf, df, a)
         except Exception as e:
             pdf.body(f"Could not generate detailed summary for this analysis ({e}).")
             pdf.body(a.get('what_found', ''))
+        pdf.end_analysis_page()
         pdf.ln(3)
+
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
     pdf.output(tmp.name)
@@ -1769,7 +1874,7 @@ with tab1:
             for i, a in enumerate(analyses):
                 with cols_ui[i%2]:
                     if st.checkbox(
-                        f"{a['title']}  \n*Accuracy: {a['accuracy']} | Score: {a['score']:.0f}/100*",
+                        f"{a['title']}  \n*{a['accuracy']}*",
                         value=True, key=f"sel_{a['id']}"):
                         selected.append(a)
 
@@ -1793,7 +1898,7 @@ with tab1:
                     st.markdown(f"**📌 What it does:** {a['description']}")
                     st.markdown(f"**💡 Why useful:** {a['why_useful']}")
                     st.markdown(f"**🔎 What brain found:** {a['what_found']}")
-                    st.markdown(f"**📊 Accuracy:** {a['accuracy']}  |  **Score:** {a['score']:.0f}/100")
+                    st.markdown(f"**📊 Accuracy:** {a['accuracy']}")
                     st.markdown(f"**🔧 Columns:** {', '.join(a['cols'])}")
 
                 result = execute(df, a)
